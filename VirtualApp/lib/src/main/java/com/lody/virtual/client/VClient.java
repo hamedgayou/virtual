@@ -565,7 +565,10 @@ public final class VClient extends IVClient.Stub {
 //            }
             mInitialApplication = LoadedApk.makeApplication.call(data.info, false, null);
         } catch (Throwable e) {
-            throw new RuntimeException("Unable to makeApplication", e);
+			if(Build.VERSION.SDK_INT >= 31)
+			{
+				// ignored
+			}
         }
         Log.e("kk", data.info+" mInitialApplication set  " + LoadedApk.mApplication.get(data.info));
         mirror.android.app.ActivityThread.mInitialApplication.set(mainThread, mInitialApplication);
