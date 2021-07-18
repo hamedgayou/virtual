@@ -26,7 +26,7 @@ void ensureMethodCached(art::mirror::ArtMethod *hookMethod, art::mirror::ArtMeth
     if (SDK_INT >= ANDROID_P)
         return;
 
-    SandHook::StopTheWorld stopTheWorld;
+    //SandHook::StopTheWorld stopTheWorld;
 
     uint32_t index = backupMethod->getDexMethodIndex();
     if (SDK_INT < ANDROID_O2) {
