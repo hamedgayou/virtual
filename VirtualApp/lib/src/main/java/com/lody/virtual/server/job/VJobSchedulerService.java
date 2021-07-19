@@ -10,13 +10,11 @@ import android.os.Parcel;
 import android.os.Parcelable;
 import android.os.PersistableBundle;
 import android.text.TextUtils;
-
 import com.lody.virtual.client.core.VirtualCore;
 import com.lody.virtual.client.ipc.VJobScheduler;
 import com.lody.virtual.client.stub.StubManifest;
 import com.lody.virtual.helper.utils.Singleton;
 import com.lody.virtual.os.VEnvironment;
-import com.lody.virtual.os.VUserHandle;
 import com.lody.virtual.remote.VJobWorkItem;
 import com.lody.virtual.server.interfaces.IJobService;
 
@@ -24,10 +22,10 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
-import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 
 /**
@@ -38,8 +36,12 @@ public class VJobSchedulerService extends IJobService.Stub {
 
     private static final String TAG = VJobScheduler.class.getSimpleName();
 
+    private static final int SINGLE_MAX_JOB = 30;//单个应用最大的Jobservice
+    private static final int MAX_JOB = 90;//所有应用最大的Jobservice
+
     private static final int JOB_FILE_VERSION = 1;
-    private final Map<JobId, JobConfig> mJobStore = new HashMap<>();
+    private volatile Map<JobId, JobConfig> mJobStore = new ConcurrentHashMap<>();
+
     private int mNextJobId = 1;
 
     private final JobScheduler mScheduler = (JobScheduler)
@@ -65,6 +67,14 @@ public class VJobSchedulerService extends IJobService.Stub {
 
 
     public static final class JobId implements Parcelable {
+        @Override
+        public String toString() {
+            return "JobId{" +
+                    "vuid=" + vuid +
+                    ", packageName='" + packageName + '\'' +
+                    ", clientJobId=" + clientJobId +
+                    '}';
+        }
 
         public int vuid;
         public String packageName;
@@ -88,8 +98,10 @@ public class VJobSchedulerService extends IJobService.Stub {
 
         @Override
         public boolean equals(Object o) {
-            if (this == o) return true;
-            if (o == null || getClass() != o.getClass()) return false;
+            if (this == o)
+                return true;
+            if (o == null || getClass() != o.getClass())
+                return false;
 
             JobId jobId = (JobId) o;
 
@@ -139,13 +151,35 @@ public class VJobSchedulerService extends IJobService.Stub {
         public int virtualJobId;
         public String serviceName;
         public PersistableBundle extras;
-        public long intervalMillis;
-        public long flexMillis;
+        public String pkgName;
 
-        JobConfig(int virtualJobId, String serviceName, PersistableBundle extra) {
+        @Override
+        public String toString() {
+            return "JobConfig{" +
+                    "virtualJobId=" + virtualJobId +
+                    ", serviceName='" + serviceName + '\'' +
+                    ", extras=" + extras +
+                    ", pkgName='" + pkgName + '\'' +
+                    '}';
+        }
+
+        JobConfig(int virtualJobId, String serviceName, String pkgName, PersistableBundle extra) {
             this.virtualJobId = virtualJobId;
             this.serviceName = serviceName;
+            this.pkgName = pkgName;
             this.extras = extra;
+        }
+
+        JobConfig(Parcel in) {
+            try {
+                this.virtualJobId = in.readInt();
+                this.serviceName = in.readString();
+                this.pkgName = in.readString();
+                this.extras = in.readParcelable(PersistableBundle.class.getClassLoader());
+
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
         }
 
         @Override
@@ -157,17 +191,8 @@ public class VJobSchedulerService extends IJobService.Stub {
         public void writeToParcel(Parcel dest, int flags) {
             dest.writeInt(this.virtualJobId);
             dest.writeString(this.serviceName);
+            dest.writeString(this.pkgName);
             dest.writeParcelable(this.extras, flags);
-            dest.writeLong(this.intervalMillis);
-            dest.writeLong(this.flexMillis);
-        }
-
-        protected JobConfig(Parcel in) {
-            this.virtualJobId = in.readInt();
-            this.serviceName = in.readString();
-            this.extras = in.readParcelable(PersistableBundle.class.getClassLoader());
-            this.intervalMillis = in.readLong();
-            this.flexMillis = in.readLong();
         }
 
         public static final Creator<JobConfig> CREATOR = new Creator<JobConfig>() {
@@ -187,28 +212,32 @@ public class VJobSchedulerService extends IJobService.Stub {
     @Override
     public int schedule(int uid, JobInfo job) {
         int id = job.getId();
+        int schedule = JobScheduler.RESULT_FAILURE;
         ComponentName service = job.getService();
         JobId jobId = new JobId(uid, service.getPackageName(), id);
         JobConfig config;
         synchronized (mJobStore) {
+            if (mJobStore.size() > MAX_JOB || countJobsForPkg(service.getPackageName()) > SINGLE_MAX_JOB) {//最大注册的数量是90,如果大于90 直接返回失败,
+                return -1;
+            }
             config = mJobStore.get(jobId);
-            if(config == null){
+            if (config == null) {
                 int jid = mNextJobId;
                 mNextJobId++;
-                config = new JobConfig(jid, service.getClassName(), job.getExtras());
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                    config.flexMillis = job.getFlexMillis();
-                }
+                config = new JobConfig(jid, service.getClassName(), service.getPackageName(), job.getExtras());
                 mJobStore.put(jobId, config);
             }
+            config.serviceName = service.getClassName();
+            config.extras = job.getExtras();
+            mirror.android.app.job.JobInfo.jobId.set(job, config.virtualJobId);
+            mirror.android.app.job.JobInfo.service.set(job, mJobProxyComponent);
+            schedule = mScheduler.schedule(job);
+            if (schedule == JobScheduler.RESULT_SUCCESS) {
+                saveJobs();
+            }
         }
-        config.intervalMillis = job.getIntervalMillis();
-        config.serviceName = service.getClassName();
-        config.extras = job.getExtras();
-        saveJobs();
-        mirror.android.app.job.JobInfo.jobId.set(job, config.virtualJobId);
-        mirror.android.app.job.JobInfo.service.set(job, mJobProxyComponent);
-        return mScheduler.schedule(job);
+
+        return schedule;
     }
 
     private void saveJobs() {
@@ -256,11 +285,19 @@ public class VJobSchedulerService extends IJobService.Stub {
             }
             int count = p.readInt();
             int max = 0;
-            for (int i = 0; i < count; i++) {
+            List<JobInfo> allPendingJobs = mScheduler.getAllPendingJobs();
+            for (int i1 = 0; i1 < count; i1++) {
                 JobId jobId = new JobId(p);
                 JobConfig config = new JobConfig(p);
-                mJobStore.put(jobId, config);
-                max = Math.max(max, config.virtualJobId);
+                if (allPendingJobs != null) {
+                    for (int i = 0; i < allPendingJobs.size(); i++) {
+                        if (TextUtils.equals(allPendingJobs.get(i).getId() + "", config.virtualJobId + "")
+                                && (allPendingJobs.get(i).getService().getClassName().contains(StubManifest.STUB_JOB))) {
+                            mJobStore.put(jobId, config);
+                            max = Math.max(max, config.virtualJobId);
+                        }
+                    }
+                }
             }
             mNextJobId = max + 1;
         } catch (Exception e) {
@@ -292,19 +329,16 @@ public class VJobSchedulerService extends IJobService.Stub {
             }
         }
     }
+
     @Override
     public void cancelAll(int uid) {
-        cancelAll(VUserHandle.getAppId(uid), VUserHandle.getUserId(uid));
-    }
-
-    public void cancelAll(int appId, int userId) {
         synchronized (mJobStore) {
             boolean changed = false;
             Iterator<Map.Entry<JobId, JobConfig>> iterator = mJobStore.entrySet().iterator();
             while (iterator.hasNext()) {
                 Map.Entry<JobId, JobConfig> entry = iterator.next();
                 JobId job = entry.getKey();
-                if (VUserHandle.getAppId(job.vuid) == appId && (userId == -1 || userId == VUserHandle.getUserId(job.vuid))) {
+                if (job.vuid == uid) {
                     JobConfig config = entry.getValue();
                     mScheduler.cancel(config.virtualJobId);
                     changed = true;
@@ -332,6 +366,7 @@ public class VJobSchedulerService extends IJobService.Stub {
                 }
                 Map.Entry<JobId, JobConfig> jobEntry = findJobByVirtualJobId(job.getId());
                 if (jobEntry == null) {
+                    mScheduler.cancel(job.getId());
                     iterator.remove();
                     continue;
                 }
@@ -362,7 +397,7 @@ public class VJobSchedulerService extends IJobService.Stub {
 
     @TargetApi(Build.VERSION_CODES.N)
     @Override
-    public JobInfo getPendingJob(int uid, int jobId){
+    public JobInfo getPendingJob(int uid, int jobId) {
         JobInfo jobInfo = null;
         synchronized (mJobStore) {
             Iterator<Map.Entry<JobId, JobConfig>> iterator = mJobStore.entrySet().iterator();
@@ -380,8 +415,8 @@ public class VJobSchedulerService extends IJobService.Stub {
 
     @TargetApi(Build.VERSION_CODES.O)
     @Override
-    public int enqueue(int uid, JobInfo job, VJobWorkItem workItem){
-        if(workItem.get() == null){
+    public int enqueue(int uid, JobInfo job, VJobWorkItem workItem) {
+        if (workItem.get() == null) {
             return -1;
         }
         int id = job.getId();
@@ -390,10 +425,10 @@ public class VJobSchedulerService extends IJobService.Stub {
         JobConfig config;
         synchronized (mJobStore) {
             config = mJobStore.get(jobId);
-            if(config == null){
+            if (config == null) {
                 int jid = mNextJobId;
                 mNextJobId++;
-                config = new JobConfig(jid, service.getClassName(), job.getExtras());
+                config = new JobConfig(jid, service.getClassName(), service.getPackageName(), job.getExtras());
                 mJobStore.put(jobId, config);
             }
         }
@@ -405,4 +440,20 @@ public class VJobSchedulerService extends IJobService.Stub {
         mirror.android.app.job.JobInfo.service.set(job, mJobProxyComponent);
         return mScheduler.enqueue(job, workItem.get());
     }
+
+
+    // We only want to count the jobs that this uid has scheduled on its own
+    // behalf, not those that the app has scheduled on someone else's behalf.
+    public int countJobsForPkg(String pkgName) {
+        int total = 0;
+        for (Map.Entry<JobId, JobConfig> entry : mJobStore.entrySet()) {
+            if (entry != null && entry.getValue() != null) {
+                if (TextUtils.equals(pkgName, entry.getValue().pkgName)) {
+                    total++;
+                }
+            }
+        }
+        return total;
+    }
+
 }
