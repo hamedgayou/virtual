@@ -264,7 +264,8 @@ public final class VClient extends IVClient.Stub {
     }
     public void initProcess(ClientConfig clientConfig) {
         if (this.clientConfig != null) {
-            throw new RuntimeException("reject init process: " + clientConfig.processName + ", this process is : " + this.clientConfig.processName);
+            //if prcesss have init kill all app rather than throw exception
+            VActivityManager.get().killAllApps();
         }
         this.clientConfig = clientConfig;
     }
